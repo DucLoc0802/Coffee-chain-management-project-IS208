@@ -1,6 +1,17 @@
 package com.phungloccoffee.gui.controller.inventory;
 
+import com.phungloccoffee.bus.WarehouseWorkflowBUS;
+import com.phungloccoffee.exception.DatabaseException;
+import com.phungloccoffee.exception.PermissionException;
+import com.phungloccoffee.exception.ValidationException;
+import com.phungloccoffee.gui.service.SessionManager;
+import com.phungloccoffee.model.InventoryItem;
+import com.phungloccoffee.model.NhaCungCap;
+import com.phungloccoffee.model.WarehouseSlip;
+import com.phungloccoffee.model.WarehouseSlipLine;
 import com.phungloccoffee.util.AlertUtils;
+import javafx.beans.property.SimpleDoubleProperty;
+import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.fxml.FXML;
@@ -19,16 +30,19 @@ import javafx.scene.control.cell.TextFieldTableCell;
 import javafx.scene.layout.HBox;
 import javafx.util.converter.DoubleStringConverter;
 
+import java.math.BigDecimal;
 import java.text.NumberFormat;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Locale;
 
 public class WarehouseFormController {
     @FXML private TextField receiptCodeField;
     @FXML private DatePicker receiptDatePicker;
-    @FXML private ComboBox<String> supplierComboBox;
+    @FXML private ComboBox<NhaCungCap> supplierComboBox;
     @FXML private TextField createdByField;
     @FXML private TextField attachmentField;
+    @FXML private TextField totalQuantityField;
     @FXML private TextArea noteArea;
     @FXML private TextField materialSearchField;
     @FXML private TableView<MaterialRow> materialTable;
@@ -43,10 +57,11 @@ public class WarehouseFormController {
     @FXML private TableColumn<ImportDetailRow, String> detailNameColumn;
     @FXML private TableColumn<ImportDetailRow, String> detailUnitColumn;
     @FXML private TableColumn<ImportDetailRow, Double> detailQuantityColumn;
-    @FXML private TableColumn<ImportDetailRow, String> detailPriceColumn;
+    @FXML private TableColumn<ImportDetailRow, Double> detailPriceColumn;
     @FXML private TableColumn<ImportDetailRow, String> detailTotalColumn;
     @FXML private TableColumn<ImportDetailRow, Void> detailActionColumn;
 
+    private final WarehouseWorkflowBUS workflowBUS = new WarehouseWorkflowBUS();
     private final ObservableList<MaterialRow> materials = FXCollections.observableArrayList();
     private final ObservableList<ImportDetailRow> details = FXCollections.observableArrayList();
     private final NumberFormat currencyFormat = NumberFormat.getInstance(new Locale("vi", "VN"));
@@ -54,8 +69,8 @@ public class WarehouseFormController {
     @FXML
     private void initialize() {
         receiptDatePicker.setValue(LocalDate.now());
-        supplierComboBox.getItems().setAll("Công ty cà phê Phụng Lộc", "Vinamilk", "Bao bì An Phát", "Sweet Syrup Việt Nam");
-        supplierComboBox.getSelectionModel().selectFirst();
+        createdByField.setText(SessionManager.getCurrentUser() == null ? "" : SessionManager.getCurrentUser().getFullName());
+        createdByField.setEditable(false);
 
         materialCodeColumn.setCellValueFactory(new PropertyValueFactory<>("code"));
         materialNameColumn.setCellValueFactory(new PropertyValueFactory<>("name"));
@@ -79,24 +94,49 @@ public class WarehouseFormController {
             ImportDetailRow row = event.getRowValue();
             row.setQuantity(Math.max(0, event.getNewValue()));
             detailTable.refresh();
-            updateTotal();
+            syncTotalsFromDetails();
         });
-        detailPriceColumn.setCellValueFactory(new PropertyValueFactory<>("priceText"));
+        detailPriceColumn.setCellValueFactory(new PropertyValueFactory<>("price"));
+        detailPriceColumn.setCellFactory(TextFieldTableCell.forTableColumn(new DoubleStringConverter()));
+        detailPriceColumn.setOnEditCommit(event -> {
+            ImportDetailRow row = event.getRowValue();
+            row.setPrice(Math.max(0, event.getNewValue()));
+            detailTable.refresh();
+            syncTotalsFromDetails();
+        });
         detailTotalColumn.setCellValueFactory(new PropertyValueFactory<>("totalText"));
         detailActionColumn.setCellFactory(column -> new RemoveCell());
         detailTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
         detailTable.setItems(details);
 
+        loadSuppliers();
         loadMaterials();
     }
 
+    private void loadSuppliers() {
+        try {
+            supplierComboBox.setItems(FXCollections.observableArrayList(workflowBUS.loadActiveSuppliers()));
+            if (!supplierComboBox.getItems().isEmpty()) {
+                supplierComboBox.getSelectionModel().selectFirst();
+            }
+        } catch (Exception e) {
+            supplierComboBox.setItems(FXCollections.observableArrayList(
+                    new NhaCungCap("NCC001", "Nhà cung cấp mặc định", null, null, 1)
+            ));
+            supplierComboBox.getSelectionModel().selectFirst();
+        }
+    }
+
     private void loadMaterials() {
-        materials.setAll(
-                new MaterialRow("NL001", "Cà phê rang xay", "kg", 34, 180000),
-                new MaterialRow("NL002", "Sữa tươi không đường", "lít", 12, 32000),
-                new MaterialRow("NL003", "Đường cát trắng", "kg", 25, 22000),
-                new MaterialRow("NL004", "Ly giấy M", "cái", 420, 1200)
-        );
+        try {
+            List<InventoryItem> inventoryItems = workflowBUS.loadMaterialsForCurrentBranch();
+            materials.setAll(inventoryItems.stream().map(MaterialRow::from).toList());
+        } catch (Exception e) {
+            materials.setAll(
+                    new MaterialRow("NL001", "Cà phê rang xay", "KG", 34, 180000),
+                    new MaterialRow("NL002", "Sữa tươi không đường", "L", 12, 32000)
+            );
+        }
     }
 
     @FXML
@@ -114,40 +154,88 @@ public class WarehouseFormController {
             details.add(new ImportDetailRow(selected.getCode(), selected.getName(), selected.getUnit(), 1, selected.getPrice()));
         } else {
             existing.setQuantity(existing.getQuantity() + 1);
-            detailTable.refresh();
         }
-        updateTotal();
+        detailTable.refresh();
+        syncTotalsFromDetails();
     }
 
     @FXML
     private void saveDraft() {
-        AlertUtils.showInfo("Đã lưu nháp phiếu nhập kho.");
+        persist(false);
     }
 
     @FXML
     private void saveImport() {
-        if (details.isEmpty()) {
-            AlertUtils.showWarning("Vui lòng thêm ít nhất một nguyên liệu vào phiếu nhập.");
-            return;
-        }
-        AlertUtils.showInfo("Đã lưu phiếu nhập kho trên giao diện.");
+        persist(true);
     }
 
     @FXML
     private void cancelForm() {
-        details.clear();
-        updateTotal();
-        noteArea.clear();
+        receiptCodeField.clear();
         attachmentField.clear();
+        totalQuantityField.clear();
+        noteArea.clear();
+        details.clear();
+        syncTotalsFromDetails();
     }
 
-    private void updateTotal() {
-        double total = details.stream().mapToDouble(ImportDetailRow::getTotal).sum();
-        totalAmountLabel.setText(formatCurrency(total));
+    private void persist(boolean submit) {
+        try {
+            WarehouseSlip slip = new WarehouseSlip();
+            slip.setSlipId(receiptCodeField.getText());
+            slip.setSupplierId(supplierComboBox.getValue() == null ? null : supplierComboBox.getValue().getNhaCungCapId());
+            slip.setNote(joinNoteAndAttachment());
+            slip.setLines(details.stream().map(ImportDetailRow::toLine).toList());
+            if (submit) {
+                workflowBUS.submitImport(slip);
+                AlertUtils.showInfo("Phiếu nhập kho đã gửi duyệt. Tồn kho chưa được cập nhật.");
+            } else {
+                workflowBUS.saveImportDraft(slip);
+                AlertUtils.showInfo("Đã lưu nháp phiếu nhập kho.");
+            }
+            cancelForm();
+            loadMaterials();
+        } catch (ValidationException | PermissionException | DatabaseException e) {
+            AlertUtils.showError(e.getMessage());
+        }
+    }
+
+    private String joinNoteAndAttachment() {
+        String attachment = attachmentField.getText() == null ? "" : attachmentField.getText().trim();
+        String note = noteArea.getText() == null ? "" : noteArea.getText().trim();
+        String quantity = totalQuantityField.getText() == null ? "" : totalQuantityField.getText().trim();
+        StringBuilder builder = new StringBuilder();
+        if (!attachment.isBlank()) {
+            builder.append("Chứng từ: ").append(attachment);
+        }
+        if (!quantity.isBlank()) {
+            if (builder.length() > 0) {
+                builder.append("\n");
+            }
+            builder.append("Số lượng: ").append(quantity);
+        }
+        if (!note.isBlank()) {
+            if (builder.length() > 0) {
+                builder.append("\n");
+            }
+            builder.append(note);
+        }
+        return builder.toString();
+    }
+
+    private void syncTotalsFromDetails() {
+        double totalAmount = details.stream().mapToDouble(ImportDetailRow::getTotal).sum();
+        double totalQuantity = details.stream().mapToDouble(ImportDetailRow::getQuantity).sum();
+        totalAmountLabel.setText(formatCurrency(totalAmount));
+        totalQuantityField.setText(trim(totalQuantity));
     }
 
     private String formatCurrency(double value) {
         return currencyFormat.format(value) + " đ";
+    }
+
+    private String trim(double value) {
+        return value == Math.rint(value) ? String.valueOf((int) value) : String.valueOf(value);
     }
 
     private class RemoveCell extends TableCell<ImportDetailRow, Void> {
@@ -161,7 +249,7 @@ public class WarehouseFormController {
                 ImportDetailRow row = getTableRow().getItem();
                 if (row != null) {
                     details.remove(row);
-                    updateTotal();
+                    syncTotalsFromDetails();
                 }
             });
         }
@@ -173,7 +261,7 @@ public class WarehouseFormController {
         }
     }
 
-    public class MaterialRow {
+    public static class MaterialRow {
         private final String code;
         private final String name;
         private final String unit;
@@ -188,80 +276,61 @@ public class WarehouseFormController {
             this.price = price;
         }
 
-        public String getCode() {
-            return code;
+        public static MaterialRow from(InventoryItem item) {
+            return new MaterialRow(
+                    item.getItemCode(),
+                    item.getItemName(),
+                    item.getUnit(),
+                    item.getQuantityOnHand().doubleValue(),
+                    0
+            );
         }
 
-        public String getName() {
-            return name;
-        }
+        public String getCode() { return code; }
+        public String getName() { return name; }
+        public String getUnit() { return unit; }
+        public double getPrice() { return price; }
+        public String getStockText() { return valueText(stock, unit); }
+        public String getPriceText() { return NumberFormat.getInstance(new Locale("vi", "VN")).format(price) + " đ"; }
 
-        public String getUnit() {
-            return unit;
-        }
-
-        public double getPrice() {
-            return price;
-        }
-
-        public String getStockText() {
-            return trim(stock) + " " + unit;
-        }
-
-        public String getPriceText() {
-            return formatCurrency(price);
+        private static String valueText(double value, String unit) {
+            return (value == Math.rint(value) ? String.valueOf((int) value) : String.valueOf(value)) + " " + unit;
         }
     }
 
     public class ImportDetailRow {
-        private final String code;
-        private final String name;
-        private final String unit;
-        private double quantity;
-        private final double price;
+        private final SimpleStringProperty code;
+        private final SimpleStringProperty name;
+        private final SimpleStringProperty unit;
+        private final SimpleDoubleProperty quantity;
+        private final SimpleDoubleProperty price;
 
         public ImportDetailRow(String code, String name, String unit, double quantity, double price) {
-            this.code = code;
-            this.name = name;
-            this.unit = unit;
-            this.quantity = quantity;
-            this.price = price;
+            this.code = new SimpleStringProperty(code);
+            this.name = new SimpleStringProperty(name);
+            this.unit = new SimpleStringProperty(unit);
+            this.quantity = new SimpleDoubleProperty(quantity);
+            this.price = new SimpleDoubleProperty(price);
         }
 
-        public String getCode() {
-            return code;
-        }
+        public String getCode() { return code.get(); }
+        public String getName() { return name.get(); }
+        public String getUnit() { return unit.get(); }
+        public double getQuantity() { return quantity.get(); }
+        public void setQuantity(double quantity) { this.quantity.set(quantity); }
+        public double getPrice() { return price.get(); }
+        public void setPrice(double value) { this.price.set(value); }
+        public double getTotal() { return getQuantity() * getPrice(); }
+        public String getTotalText() { return formatCurrency(getTotal()); }
 
-        public String getName() {
-            return name;
+        public WarehouseSlipLine toLine() {
+            WarehouseSlipLine line = new WarehouseSlipLine();
+            line.setItemId(getCode());
+            line.setItemName(getName());
+            line.setUnit(getUnit());
+            line.setQuantity(BigDecimal.valueOf(getQuantity()));
+            line.setUnitPrice(BigDecimal.valueOf(getPrice()));
+            return line;
         }
-
-        public String getUnit() {
-            return unit;
-        }
-
-        public double getQuantity() {
-            return quantity;
-        }
-
-        public void setQuantity(double quantity) {
-            this.quantity = quantity;
-        }
-
-        public double getTotal() {
-            return quantity * price;
-        }
-
-        public String getPriceText() {
-            return formatCurrency(price);
-        }
-
-        public String getTotalText() {
-            return formatCurrency(getTotal());
-        }
-    }
-
-    private String trim(double value) {
-        return value == Math.rint(value) ? String.valueOf((int) value) : String.valueOf(value);
     }
 }

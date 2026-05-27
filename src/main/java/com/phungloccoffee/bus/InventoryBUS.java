@@ -1,13 +1,16 @@
 package com.phungloccoffee.bus;
 
 import com.phungloccoffee.dao.InventoryDAO;
+import com.phungloccoffee.dao.WarehouseWorkflowDAO;
 import com.phungloccoffee.dao.WarehouseTransactionDAO;
 import com.phungloccoffee.exception.DatabaseException;
 import com.phungloccoffee.exception.PermissionException;
 import com.phungloccoffee.exception.ValidationException;
 import com.phungloccoffee.model.InventoryItem;
+import com.phungloccoffee.model.WarehouseSlipStatus;
 import com.phungloccoffee.model.WarehouseTransaction;
 import com.phungloccoffee.model.WarehouseTransactionDetail;
+import com.phungloccoffee.util.SessionManager;
 import com.phungloccoffee.util.ValidationUtils;
 
 import java.time.LocalDateTime;
@@ -15,11 +18,23 @@ import java.util.List;
 
 public class InventoryBUS extends PermissionBUS {
     private final InventoryDAO inventoryDAO = new InventoryDAO();
+    private final WarehouseWorkflowDAO workflowDAO = new WarehouseWorkflowDAO();
     private final WarehouseTransactionDAO transactionDAO = new WarehouseTransactionDAO();
 
     public List<InventoryItem> loadInventoryItems() throws DatabaseException, PermissionException {
         requireRole("NHAN_VIEN_KHO", "QUAN_LY_CHI_NHANH", "IT_ADMIN");
         return inventoryDAO.findAll();
+    }
+
+    public List<InventoryItem> loadInventoryItemsForCurrentBranch() throws DatabaseException, PermissionException, ValidationException {
+        requireRole("NHAN_VIEN_KHO", "QUAN_LY_CHI_NHANH", "IT_ADMIN");
+        String branchId = SessionManager.getCurrentBranchId();
+        if (branchId == null || branchId.isBlank()) {
+            return inventoryDAO.findAll();
+        }
+        String khoId = workflowDAO.findDefaultWarehouseByBranch(branchId)
+                .orElseThrow(() -> new ValidationException("Không tìm thấy kho cho chi nhánh hiện tại."));
+        return inventoryDAO.findByKho(khoId);
     }
 
     public void createTransaction(String type, String branchName, List<WarehouseTransactionDetail> details) throws ValidationException, PermissionException, DatabaseException {
@@ -29,7 +44,7 @@ public class InventoryBUS extends PermissionBUS {
         if (details == null || details.isEmpty()) {
             throw new ValidationException("Phiếu kho chưa có nguyên liệu.");
         }
-        WarehouseTransaction transaction = new WarehouseTransaction(0, "WH" + System.currentTimeMillis(), type, branchName, "NHAP", 0, LocalDateTime.now());
+        WarehouseTransaction transaction = new WarehouseTransaction(0, "WH" + System.currentTimeMillis(), type, branchName, WarehouseSlipStatus.PENDING_APPROVAL, 0, LocalDateTime.now());
         transactionDAO.create(transaction, details);
     }
 }

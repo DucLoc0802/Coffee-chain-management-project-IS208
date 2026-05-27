@@ -1,6 +1,16 @@
 package com.phungloccoffee.gui.controller.inventory;
 
+import com.phungloccoffee.bus.WarehouseWorkflowBUS;
+import com.phungloccoffee.exception.DatabaseException;
+import com.phungloccoffee.exception.PermissionException;
+import com.phungloccoffee.exception.ValidationException;
+import com.phungloccoffee.gui.service.SessionManager;
+import com.phungloccoffee.model.InventoryItem;
+import com.phungloccoffee.model.WarehouseSlip;
+import com.phungloccoffee.model.WarehouseSlipLine;
 import com.phungloccoffee.util.AlertUtils;
+import javafx.beans.property.SimpleDoubleProperty;
+import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.fxml.FXML;
@@ -14,12 +24,16 @@ import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
+import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.cell.PropertyValueFactory;
 import javafx.scene.control.cell.TextFieldTableCell;
 import javafx.scene.layout.HBox;
 import javafx.util.converter.DoubleStringConverter;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
 
 public class ExportFormController {
     @FXML private TextField exportCodeField;
@@ -27,7 +41,7 @@ public class ExportFormController {
     @FXML private ComboBox<String> reasonComboBox;
     @FXML private TextField createdByField;
     @FXML private TextField receiverField;
-    @FXML private TextField attachmentField;
+    @FXML private TextField totalQuantityField;
     @FXML private TextArea noteArea;
     @FXML private TextField materialSearchField;
     @FXML private TableView<MaterialRow> materialTable;
@@ -46,14 +60,18 @@ public class ExportFormController {
     @FXML private TableColumn<ExportDetailRow, String> detailStatusColumn;
     @FXML private TableColumn<ExportDetailRow, Void> detailActionColumn;
 
+    private final WarehouseWorkflowBUS workflowBUS = new WarehouseWorkflowBUS();
     private final ObservableList<MaterialRow> materials = FXCollections.observableArrayList();
     private final ObservableList<ExportDetailRow> details = FXCollections.observableArrayList();
 
     @FXML
     private void initialize() {
         exportDatePicker.setValue(LocalDate.now());
-        reasonComboBox.getItems().setAll("Bổ sung ca bán", "Chuyển quầy pha chế", "Hư hỏng", "Điều chuyển nội bộ");
+        createdByField.setText(SessionManager.getCurrentUser() == null ? "" : SessionManager.getCurrentUser().getFullName());
+        createdByField.setEditable(false);
+        reasonComboBox.getItems().setAll("Bổ sung ca bán", "Xuất hủy", "Điều chuyển nội bộ", "Khác");
         reasonComboBox.getSelectionModel().selectFirst();
+        totalQuantityField.setEditable(false);
 
         materialCodeColumn.setCellValueFactory(new PropertyValueFactory<>("code"));
         materialNameColumn.setCellValueFactory(new PropertyValueFactory<>("name"));
@@ -90,12 +108,15 @@ public class ExportFormController {
     }
 
     private void loadMaterials() {
-        materials.setAll(
-                new MaterialRow("NL001", "Cà phê rang xay", "kg", 34, 20),
-                new MaterialRow("NL002", "Sữa tươi không đường", "lít", 12, 15),
-                new MaterialRow("NL003", "Đường cát trắng", "kg", 25, 10),
-                new MaterialRow("NL004", "Ly giấy M", "cái", 420, 200)
-        );
+        try {
+            List<InventoryItem> inventoryItems = workflowBUS.loadMaterialsForCurrentBranch();
+            materials.setAll(inventoryItems.stream().map(MaterialRow::from).toList());
+        } catch (Exception e) {
+            materials.setAll(
+                    new MaterialRow("NL001", "Ca phe rang xay", "KG", 34, 20),
+                    new MaterialRow("NL002", "Sữa tươi không đường", "L", 12, 15)
+            );
+        }
     }
 
     @FXML
@@ -105,43 +126,103 @@ public class ExportFormController {
             AlertUtils.showWarning("Vui lòng chọn nguyên liệu cần xuất.");
             return;
         }
+        Optional<Double> quantity = promptForQuantity(selected);
+        if (quantity.isEmpty()) {
+            return;
+        }
         ExportDetailRow existing = details.stream()
                 .filter(row -> row.getCode().equals(selected.getCode()))
                 .findFirst()
                 .orElse(null);
         if (existing == null) {
-            details.add(new ExportDetailRow(selected.getCode(), selected.getName(), selected.getUnit(), 1,
+            details.add(new ExportDetailRow(selected.getCode(), selected.getName(), selected.getUnit(), quantity.get(),
                     selected.getStock(), selected.getWarningLevel()));
         } else {
-            existing.setQuantity(existing.getQuantity() + 1);
-            detailTable.refresh();
+            existing.setQuantity(existing.getQuantity() + quantity.get());
+        }
+        detailTable.refresh();
+        updateTotalQuantity();
+    }
+
+    private Optional<Double> promptForQuantity(MaterialRow selected) {
+        TextInputDialog dialog = new TextInputDialog("1");
+        dialog.setTitle("Chọn số lượng xuất");
+        dialog.setHeaderText("Nhập số lượng cho " + selected.getName());
+        dialog.setContentText("Số lượng:");
+        Optional<String> result = dialog.showAndWait();
+        if (result.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            double value = Double.parseDouble(result.get().trim());
+            if (value <= 0) {
+                AlertUtils.showWarning("Số lượng xuất phải lớn hơn 0.");
+                return Optional.empty();
+            }
+            return Optional.of(value);
+        } catch (NumberFormatException ex) {
+            AlertUtils.showWarning("Số lượng không hợp lệ.");
+            return Optional.empty();
         }
     }
 
     @FXML
     private void saveDraft() {
-        AlertUtils.showInfo("Đã lưu nháp phiếu xuất kho.");
+        persist(false);
     }
 
     @FXML
     private void submitExport() {
-        if (details.isEmpty()) {
-            AlertUtils.showWarning("Vui lòng thêm ít nhất một nguyên liệu vào phiếu xuất.");
-            return;
-        }
-        boolean hasInvalidStock = details.stream().anyMatch(row -> row.getStockAfter() < 0);
-        if (hasInvalidStock) {
-            AlertUtils.showError("Không thể gửi duyệt vì có dòng Không đủ tồn.");
-            return;
-        }
-        AlertUtils.showInfo("Đã gửi duyệt phiếu xuất kho trên giao diện.");
+        persist(true);
     }
 
     @FXML
     private void cancelForm() {
-        details.clear();
+        exportCodeField.clear();
+        receiverField.clear();
+        totalQuantityField.clear();
         noteArea.clear();
-        attachmentField.clear();
+        details.clear();
+    }
+
+    private void persist(boolean submit) {
+        try {
+            WarehouseSlip slip = new WarehouseSlip();
+            slip.setSlipId(exportCodeField.getText());
+            slip.setReason(reasonComboBox.getValue());
+            slip.setNote(buildNote());
+            slip.setLines(details.stream().map(ExportDetailRow::toLine).toList());
+            if (submit) {
+                workflowBUS.submitExport(slip);
+                AlertUtils.showInfo("Phiếu xuất kho đã gửi duyệt. Tồn kho chưa bị trừ.");
+            } else {
+                workflowBUS.saveExportDraft(slip);
+                AlertUtils.showInfo("Đã lưu nháp phiếu xuất kho.");
+            }
+            cancelForm();
+            loadMaterials();
+        } catch (ValidationException | PermissionException | DatabaseException e) {
+            AlertUtils.showError(e.getMessage());
+        }
+    }
+
+    private String buildNote() {
+        StringBuilder builder = new StringBuilder();
+        if (receiverField.getText() != null && !receiverField.getText().isBlank()) {
+            builder.append("Nơi nhận: ").append(receiverField.getText().trim());
+        }
+        if (noteArea.getText() != null && !noteArea.getText().isBlank()) {
+            if (builder.length() > 0) {
+                builder.append("\n");
+            }
+            builder.append(noteArea.getText().trim());
+        }
+        return builder.toString();
+    }
+
+    private void updateTotalQuantity() {
+        double total = details.stream().mapToDouble(ExportDetailRow::getQuantity).sum();
+        totalQuantityField.setText(quantityText(total, "đơn vị"));
     }
 
     private String quantityText(double value, String unit) {
@@ -184,6 +265,7 @@ public class ExportFormController {
                 ExportDetailRow row = getTableRow().getItem();
                 if (row != null) {
                     details.remove(row);
+                    updateTotalQuantity();
                 }
             });
         }
@@ -195,7 +277,7 @@ public class ExportFormController {
         }
     }
 
-    public class MaterialRow {
+    public static class MaterialRow {
         private final String code;
         private final String name;
         private final String unit;
@@ -210,83 +292,54 @@ public class ExportFormController {
             this.warningLevel = warningLevel;
         }
 
-        public String getCode() {
-            return code;
+        public static MaterialRow from(InventoryItem item) {
+            return new MaterialRow(
+                    item.getItemCode(),
+                    item.getItemName(),
+                    item.getUnit(),
+                    item.getQuantityOnHand().doubleValue(),
+                    item.getReorderLevel().doubleValue()
+            );
         }
 
-        public String getName() {
-            return name;
-        }
+        public String getCode() { return code; }
+        public String getName() { return name; }
+        public String getUnit() { return unit; }
+        public double getStock() { return stock; }
+        public double getWarningLevel() { return warningLevel; }
+        public String getStockText() { return trim(stock) + " " + unit; }
+        public String getWarningText() { return trim(warningLevel) + " " + unit; }
 
-        public String getUnit() {
-            return unit;
-        }
-
-        public double getStock() {
-            return stock;
-        }
-
-        public double getWarningLevel() {
-            return warningLevel;
-        }
-
-        public String getStockText() {
-            return quantityText(stock, unit);
-        }
-
-        public String getWarningText() {
-            return quantityText(warningLevel, unit);
+        private static String trim(double value) {
+            return value == Math.rint(value) ? String.valueOf((int) value) : String.valueOf(value);
         }
     }
 
     public class ExportDetailRow {
-        private final String code;
-        private final String name;
-        private final String unit;
-        private double quantity;
+        private final SimpleStringProperty code;
+        private final SimpleStringProperty name;
+        private final SimpleStringProperty unit;
+        private final SimpleDoubleProperty quantity;
         private final double stock;
         private final double warningLevel;
 
         public ExportDetailRow(String code, String name, String unit, double quantity, double stock, double warningLevel) {
-            this.code = code;
-            this.name = name;
-            this.unit = unit;
-            this.quantity = quantity;
+            this.code = new SimpleStringProperty(code);
+            this.name = new SimpleStringProperty(name);
+            this.unit = new SimpleStringProperty(unit);
+            this.quantity = new SimpleDoubleProperty(quantity);
             this.stock = stock;
             this.warningLevel = warningLevel;
         }
 
-        public String getCode() {
-            return code;
-        }
-
-        public String getName() {
-            return name;
-        }
-
-        public String getUnit() {
-            return unit;
-        }
-
-        public double getQuantity() {
-            return quantity;
-        }
-
-        public void setQuantity(double quantity) {
-            this.quantity = quantity;
-        }
-
-        public double getStockAfter() {
-            return stock - quantity;
-        }
-
-        public String getStockText() {
-            return quantityText(stock, unit);
-        }
-
-        public String getStockAfterText() {
-            return quantityText(getStockAfter(), unit);
-        }
+        public String getCode() { return code.get(); }
+        public String getName() { return name.get(); }
+        public String getUnit() { return unit.get(); }
+        public double getQuantity() { return quantity.get(); }
+        public void setQuantity(double quantity) { this.quantity.set(quantity); }
+        public double getStockAfter() { return stock - getQuantity(); }
+        public String getStockText() { return quantityText(stock, getUnit()); }
+        public String getStockAfterText() { return quantityText(getStockAfter(), getUnit()); }
 
         public String getStatus() {
             if (getStockAfter() < 0) {
@@ -296,6 +349,16 @@ public class ExportFormController {
                 return "Dưới mức cảnh báo";
             }
             return "Hợp lệ";
+        }
+
+        public WarehouseSlipLine toLine() {
+            WarehouseSlipLine line = new WarehouseSlipLine();
+            line.setItemId(getCode());
+            line.setItemName(getName());
+            line.setUnit(getUnit());
+            line.setQuantity(BigDecimal.valueOf(getQuantity()));
+            line.setNote("Tồn hiện tại: " + getStockText());
+            return line;
         }
     }
 }
